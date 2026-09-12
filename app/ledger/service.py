@@ -1,10 +1,15 @@
 from decimal import Decimal
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.accounts.model import Account, AccountStatus, AccountType
+from app.accounts.model import (
+    Account,
+    AccountStatus,
+    AccountType,
+)
+
 from app.ledger.model import (
     LedgerEntry,
     Transaction,
@@ -46,7 +51,6 @@ async def create_deposit(
     if system_account is None:
         raise ValueError("SYSTEM_CASH account not found")
 
-    # Create transaction
     transaction = Transaction(
         transaction_type=TransactionType.DEPOSIT,
         status=TransactionStatus.POSTED,
@@ -55,7 +59,6 @@ async def create_deposit(
 
     db.add(transaction)
 
-    # Generate transaction ID
     await db.flush()
 
     # SYSTEM_CASH loses money
@@ -65,7 +68,7 @@ async def create_deposit(
         amount=-amount,
     )
 
-    # USER receives money
+    # User receives money
     user_entry = LedgerEntry(
         transaction_id=transaction.transaction_id,
         account_id=account.account_id,
@@ -78,19 +81,29 @@ async def create_deposit(
     ])
 
     await db.commit()
-
     await db.refresh(transaction)
 
     return transaction, account
-
-
-from sqlalchemy import func
 
 
 async def get_balance(
     db: AsyncSession,
     account_id: UUID,
 ) -> Decimal:
+
+    # Make sure account exists
+    result = await db.execute(
+        select(Account).where(
+            Account.account_id == account_id
+        )
+    )
+
+    account = result.scalar_one_or_none()
+
+    if account is None:
+        raise ValueError("Account not found")
+
+    # Reconstruct balance from ledger
     result = await db.execute(
         select(
             func.coalesce(
@@ -106,15 +119,19 @@ async def get_balance(
 
     return Decimal(str(balance))
 
+
 async def create_withdrawal(
     db: AsyncSession,
     account_id: UUID,
     amount: Decimal,
 ):
+    # Lock account before checking balance
     result = await db.execute(
-        select(Account).where(
+        select(Account)
+        .where(
             Account.account_id == account_id
         )
+        .with_for_update()
     )
 
     account = result.scalar_one_or_none()
@@ -125,6 +142,7 @@ async def create_withdrawal(
     if account.status != AccountStatus.ACTIVE:
         raise ValueError("Account is not active")
 
+    # Calculate balance while account is locked
     current_balance = await get_balance(
         db,
         account_id,
@@ -133,6 +151,7 @@ async def create_withdrawal(
     if current_balance < amount:
         raise ValueError("Insufficient funds")
 
+    # Find SYSTEM_CASH
     result = await db.execute(
         select(Account).where(
             Account.account_type == AccountType.SYSTEM,
@@ -155,12 +174,14 @@ async def create_withdrawal(
 
     await db.flush()
 
+    # User loses money
     user_entry = LedgerEntry(
         transaction_id=transaction.transaction_id,
         account_id=account.account_id,
         amount=-amount,
     )
 
+    # SYSTEM_CASH receives money
     system_entry = LedgerEntry(
         transaction_id=transaction.transaction_id,
         account_id=system_account.account_id,
@@ -173,7 +194,154 @@ async def create_withdrawal(
     ])
 
     await db.commit()
-
     await db.refresh(transaction)
 
     return transaction, account
+
+
+async def create_transfer(
+    db: AsyncSession,
+    from_account_id: UUID,
+    to_account_id: UUID,
+    amount: Decimal,
+    idempotency_key: str,
+):
+    # --------------------------------------------------
+    # 1. Check idempotency
+    # --------------------------------------------------
+
+    result = await db.execute(
+        select(Transaction).where(
+            Transaction.idempotency_key == idempotency_key
+        )
+    )
+
+    existing_transaction = result.scalar_one_or_none()
+
+    if existing_transaction is not None:
+        return existing_transaction
+
+    # --------------------------------------------------
+    # 2. Validate accounts
+    # --------------------------------------------------
+
+    if from_account_id == to_account_id:
+        raise ValueError(
+            "Source and destination accounts must be different"
+        )
+
+    # Always lock accounts in deterministic order.
+    # This prevents deadlocks between opposite transfers.
+    account_ids = sorted([
+        from_account_id,
+        to_account_id,
+    ])
+
+    result = await db.execute(
+        select(Account)
+        .where(
+            Account.account_id.in_(account_ids)
+        )
+        .order_by(Account.account_id)
+        .with_for_update()
+    )
+
+    accounts = result.scalars().all()
+
+    if len(accounts) != 2:
+        raise ValueError(
+            "One or both accounts not found"
+        )
+
+    account_map = {
+        account.account_id: account
+        for account in accounts
+    }
+
+    source = account_map[from_account_id]
+    destination = account_map[to_account_id]
+
+    if source.status != AccountStatus.ACTIVE:
+        raise ValueError(
+            "Source account is not active"
+        )
+
+    if destination.status != AccountStatus.ACTIVE:
+        raise ValueError(
+            "Destination account is not active"
+        )
+
+    if source.currency != destination.currency:
+        raise ValueError(
+            "Currency mismatch"
+        )
+
+    # --------------------------------------------------
+    # 3. Calculate source balance
+    # --------------------------------------------------
+
+    result = await db.execute(
+        select(
+            func.coalesce(
+                func.sum(LedgerEntry.amount),
+                0,
+            )
+        ).where(
+            LedgerEntry.account_id == from_account_id
+        )
+    )
+
+    source_balance = Decimal(
+        str(result.scalar_one())
+    )
+
+    if source_balance < amount:
+        raise ValueError(
+            "Insufficient funds"
+        )
+
+    # --------------------------------------------------
+    # 4. Create transaction
+    # --------------------------------------------------
+
+    transaction = Transaction(
+        transaction_type=TransactionType.TRANSFER,
+        status=TransactionStatus.POSTED,
+        reference="Transfer",
+        idempotency_key=idempotency_key,
+    )
+
+    db.add(transaction)
+
+    await db.flush()
+
+    # --------------------------------------------------
+    # 5. Create double-entry ledger records
+    # --------------------------------------------------
+
+    source_entry = LedgerEntry(
+        transaction_id=transaction.transaction_id,
+        account_id=from_account_id,
+        amount=-amount,
+    )
+
+    destination_entry = LedgerEntry(
+        transaction_id=transaction.transaction_id,
+        account_id=to_account_id,
+        amount=amount,
+    )
+
+    db.add_all([
+        source_entry,
+        destination_entry,
+    ])
+
+    # --------------------------------------------------
+    # 6. Commit atomically
+    # --------------------------------------------------
+
+    await db.commit()
+
+    await db.refresh(transaction)
+
+    return transaction

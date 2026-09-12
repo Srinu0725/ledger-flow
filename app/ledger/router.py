@@ -1,16 +1,21 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from uuid import UUID
+from fastapi import Header
 from app.db.database import get_db
 from app.ledger.schemas import (
     DepositRequest,
     DepositResponse,
     WithdrawalRequest,
     WithdrawalResponse,
+    TransferRequest,
+    TransferResponse,
 )
+
 from app.ledger.service import (
     create_deposit,
     create_withdrawal,
+    create_transfer,
     get_balance,
 )
 
@@ -48,6 +53,7 @@ async def deposit(
             detail=str(e),
         )
         
+            
 @router.get("/accounts/{account_id}/balance")
 async def balance(
     account_id: UUID,
@@ -98,3 +104,36 @@ async def withdraw(
             status_code=400,
             detail=str(e),
         )
+        
+@router.post(
+    "/transfer",
+    response_model=TransferResponse,
+)
+async def transfer(
+    request: TransferRequest,
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        transaction = await create_transfer(
+            db=db,
+            from_account_id=request.from_account_id,
+            to_account_id=request.to_account_id,
+            amount=request.amount,
+            idempotency_key=idempotency_key,
+        )
+
+        return TransferResponse(
+            transaction_id=transaction.transaction_id,
+            from_account_id=request.from_account_id,
+            to_account_id=request.to_account_id,
+            amount=request.amount,
+            status=transaction.status.value,
+        )
+
+    except ValueError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=str(e),
+        )        
+        

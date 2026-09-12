@@ -2,10 +2,10 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Enum, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.models import Base
+from sqlalchemy import DateTime, Enum, String, UniqueConstraint
 
 
 class TransactionType(str, enum.Enum):
@@ -22,6 +22,13 @@ class TransactionStatus(str, enum.Enum):
 
 class Transaction(Base):
     __tablename__ = "transactions"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "idempotency_key",
+            name="uq_transactions_idempotency_key",
+        ),
+    )
 
     transaction_id: Mapped[uuid.UUID] = mapped_column(
         primary_key=True,
@@ -44,12 +51,17 @@ class Transaction(Base):
         nullable=True,
     )
 
+    idempotency_key: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+        unique=True,
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
         default=datetime.utcnow,
     )
-    
 from decimal import Decimal
 
 from sqlalchemy import ForeignKey, Numeric
