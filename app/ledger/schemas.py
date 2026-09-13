@@ -2,7 +2,7 @@ from decimal import Decimal
 from uuid import UUID
 
 from pydantic import BaseModel, Field
-
+from datetime import datetime
 
 class DepositRequest(BaseModel):
     account_id: UUID
@@ -38,3 +38,17 @@ class TransferResponse(BaseModel):
     to_account_id: UUID
     amount: Decimal
     status: str
+    
+class TransactionHistoryItem(BaseModel):
+    transaction_id: UUID
+    transaction_type: str
+    status: str
+    amount: Decimal
+    reference: str | None
+    created_at: datetime
+
+class TransactionHistoryResponse(BaseModel):
+    account_id: UUID
+    transactions: list[TransactionHistoryItem]
+    limit: int
+    offset: int        

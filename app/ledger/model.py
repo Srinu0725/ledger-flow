@@ -1,11 +1,21 @@
 import enum
 import uuid
 from datetime import datetime
+from decimal import Decimal
 
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Index,
+    Numeric,
+    String,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.models import Base
-from sqlalchemy import DateTime, Enum, String, UniqueConstraint
 
 
 class TransactionType(str, enum.Enum):
@@ -27,6 +37,10 @@ class Transaction(Base):
         UniqueConstraint(
             "idempotency_key",
             name="uq_transactions_idempotency_key",
+        ),
+        Index(
+            "ix_transactions_created_at",
+            "created_at",
         ),
     )
 
@@ -54,7 +68,11 @@ class Transaction(Base):
     idempotency_key: Mapped[str | None] = mapped_column(
         String(255),
         nullable=True,
-        unique=True,
+    )
+
+    request_hash: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
     )
 
     created_at: Mapped[datetime] = mapped_column(
@@ -62,11 +80,30 @@ class Transaction(Base):
         nullable=False,
         default=datetime.utcnow,
     )
-from decimal import Decimal
 
-from sqlalchemy import ForeignKey, Numeric
+
 class LedgerEntry(Base):
     __tablename__ = "ledger_entries"
+
+    __table_args__ = (
+        CheckConstraint(
+            "amount <> 0",
+            name="ck_ledger_entries_amount_nonzero",
+        ),
+        Index(
+            "ix_ledger_entries_account_id",
+            "account_id",
+        ),
+        Index(
+            "ix_ledger_entries_transaction_id",
+            "transaction_id",
+        ),
+        Index(
+            "ix_ledger_entries_account_created",
+            "account_id",
+            "created_at",
+        ),
+    )
 
     entry_id: Mapped[uuid.UUID] = mapped_column(
         primary_key=True,

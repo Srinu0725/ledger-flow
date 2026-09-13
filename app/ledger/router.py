@@ -10,6 +10,8 @@ from app.ledger.schemas import (
     WithdrawalResponse,
     TransferRequest,
     TransferResponse,
+    TransactionHistoryItem,
+    TransactionHistoryResponse,
 )
 
 from app.ledger.service import (
@@ -17,6 +19,7 @@ from app.ledger.service import (
     create_withdrawal,
     create_transfer,
     get_balance,
+    get_transaction_history,
 )
 
 router = APIRouter(
@@ -137,3 +140,46 @@ async def transfer(
             detail=str(e),
         )        
         
+        
+@router.get(
+    "/accounts/{account_id}/transactions",
+    response_model=TransactionHistoryResponse,
+)
+async def transaction_history(
+    account_id: UUID,
+    limit: int = 50,
+    offset: int = 0,
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        rows = await get_transaction_history(
+            db=db,
+            account_id=account_id,
+            limit=limit,
+            offset=offset,
+        )
+
+        transactions = [
+            TransactionHistoryItem(
+                transaction_id=transaction.transaction_id,
+                transaction_type=transaction.transaction_type.value,
+                status=transaction.status.value,
+                amount=amount,
+                reference=transaction.reference,
+                created_at=transaction.created_at,
+            )
+            for transaction, amount in rows
+        ]
+
+        return TransactionHistoryResponse(
+            account_id=account_id,
+            transactions=transactions,
+            limit=limit,
+            offset=offset,
+        )
+
+    except ValueError as e:
+        raise HTTPException(
+            status_code=404,
+            detail=str(e),
+        )        
