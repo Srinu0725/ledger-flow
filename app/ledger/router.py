@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from uuid import UUID
 from fastapi import Header
+from datetime import datetime
 from app.db.database import get_db
 from app.ledger.schemas import (
     DepositRequest,
@@ -12,6 +13,7 @@ from app.ledger.schemas import (
     TransferResponse,
     TransactionHistoryItem,
     TransactionHistoryResponse,
+    BalanceAtResponse,
 )
 
 from app.ledger.service import (
@@ -20,6 +22,7 @@ from app.ledger.service import (
     create_transfer,
     get_balance,
     get_transaction_history,
+    get_balance_at,
 )
 
 router = APIRouter(
@@ -176,6 +179,34 @@ async def transaction_history(
             transactions=transactions,
             limit=limit,
             offset=offset,
+        )
+
+    except ValueError as e:
+        raise HTTPException(
+            status_code=404,
+            detail=str(e),
+        )        
+        
+@router.get(
+    "/accounts/{account_id}/balance-at",
+    response_model=BalanceAtResponse,
+)
+async def balance_at(
+    account_id: UUID,
+    timestamp: datetime,
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        balance = await get_balance_at(
+            db=db,
+            account_id=account_id,
+            timestamp=timestamp,
+        )
+
+        return BalanceAtResponse(
+            account_id=account_id,
+            balance=balance,
+            timestamp=timestamp,
         )
 
     except ValueError as e:

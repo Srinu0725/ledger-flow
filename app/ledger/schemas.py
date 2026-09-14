@@ -2,7 +2,7 @@ from decimal import Decimal
 from uuid import UUID
 
 from pydantic import BaseModel, Field
-from datetime import datetime
+from datetime import datetime,timezone
 
 class DepositRequest(BaseModel):
     account_id: UUID
@@ -52,3 +52,8 @@ class TransactionHistoryResponse(BaseModel):
     transactions: list[TransactionHistoryItem]
     limit: int
     offset: int        
+    
+class BalanceAtResponse(BaseModel):
+    account_id: UUID
+    balance: Decimal
+    timestamp: datetime    

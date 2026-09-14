@@ -4,6 +4,8 @@ import hashlib
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
+from datetime import datetime,timezone
+
 
 from app.accounts.model import (
     Account,
@@ -560,3 +562,45 @@ async def get_transaction_history(
     rows = result.all()
 
     return rows
+
+
+async def get_balance_at(
+    db: AsyncSession,
+    account_id: UUID,
+    timestamp: datetime,
+) -> Decimal:
+
+    # Verify account exists
+    result = await db.execute(
+        select(Account).where(
+            Account.account_id == account_id
+        )
+    )
+
+    account = result.scalar_one_or_none()
+
+    if account is None:
+        raise ValueError("Account not found")
+
+    # Reconstruct balance using transaction time
+    result = await db.execute(
+        select(
+            func.coalesce(
+                func.sum(LedgerEntry.amount),
+                0,
+            )
+        )
+        .join(
+            Transaction,
+            Transaction.transaction_id
+            == LedgerEntry.transaction_id,
+        )
+        .where(
+            LedgerEntry.account_id == account_id,
+            Transaction.created_at <= timestamp,
+        )
+    )
+
+    balance = result.scalar_one()
+
+    return Decimal(str(balance))

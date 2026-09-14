@@ -1,5 +1,5 @@
 from uuid import UUID
-
+from datetime import datetime
 from pydantic import BaseModel, Field
 
 
@@ -19,3 +19,4 @@ class AccountResponse(BaseModel):
     model_config = {
         "from_attributes": True
     }
+
