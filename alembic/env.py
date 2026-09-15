@@ -6,6 +6,9 @@ from app.core.config import settings
 from app.db.models import Base
 from app.accounts.model import Account
 from app.ledger.model import Transaction, LedgerEntry
+from app.outbox.model import OutboxEvent
+from app.consumers.model import ProcessedEvent
+from app.consumers.projection_model import AccountBalanceProjection
 # Import models so Alembic can detect them
 
 config = context.config

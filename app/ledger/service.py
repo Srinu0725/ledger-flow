@@ -1,16 +1,23 @@
 from decimal import Decimal
 from uuid import UUID
 import hashlib
-from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.exc import IntegrityError
-from datetime import datetime,timezone
+import logging
+from datetime import datetime, timezone
 
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.accounts.model import (
     Account,
     AccountStatus,
     AccountType,
+)
+
+from app.ledger.cache import (
+    get_cached_balance,
+    set_cached_balance,
+    invalidate_balance,
 )
 
 from app.ledger.model import (
@@ -20,12 +27,21 @@ from app.ledger.model import (
     TransactionType,
 )
 
+from app.outbox.service import create_outbox_event
+
+
+logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
 def generate_transfer_hash(
     from_account_id: UUID,
     to_account_id: UUID,
     amount: Decimal,
 ) -> str:
-
     payload = (
         f"{from_account_id}:"
         f"{to_account_id}:"
@@ -37,12 +53,19 @@ def generate_transfer_hash(
     ).hexdigest()
 
 
+# ============================================================
+# DEPOSIT
+# ============================================================
+
 async def create_deposit(
     db: AsyncSession,
     account_id: UUID,
     amount: Decimal,
 ):
+    # --------------------------------------------------------
     # Find user account
+    # --------------------------------------------------------
+
     result = await db.execute(
         select(Account).where(
             Account.account_id == account_id
@@ -57,7 +80,10 @@ async def create_deposit(
     if account.status != AccountStatus.ACTIVE:
         raise ValueError("Account is not active")
 
+    # --------------------------------------------------------
     # Find SYSTEM_CASH account
+    # --------------------------------------------------------
+
     result = await db.execute(
         select(Account).where(
             Account.account_type == AccountType.SYSTEM,
@@ -68,7 +94,13 @@ async def create_deposit(
     system_account = result.scalar_one_or_none()
 
     if system_account is None:
-        raise ValueError("SYSTEM_CASH account not found")
+        raise ValueError(
+            "SYSTEM_CASH account not found"
+        )
+
+    # --------------------------------------------------------
+    # Create transaction
+    # --------------------------------------------------------
 
     transaction = Transaction(
         transaction_type=TransactionType.DEPOSIT,
@@ -99,18 +131,94 @@ async def create_deposit(
         user_entry,
     ])
 
+    # --------------------------------------------------------
+    # Create Outbox Event
+    # IMPORTANT:
+    # This is NOT committed separately.
+    # It will be committed with the ledger transaction.
+    # --------------------------------------------------------
+
+    await create_outbox_event(
+        db=db,
+        aggregate_id=transaction.transaction_id,
+        event_type="DEPOSIT_POSTED",
+        payload={
+            "transaction_id": str(
+                transaction.transaction_id
+            ),
+            "account_id": str(
+                account.account_id
+            ),
+            "amount": str(amount),
+            "currency": account.currency,
+        },
+    )
+
+    # --------------------------------------------------------
+    # Atomic commit
+    #
+    # Transaction
+    # Ledger Entries
+    # Outbox Event
+    #
+    # all commit together
+    # --------------------------------------------------------
+
     await db.commit()
+
     await db.refresh(transaction)
+
+    # --------------------------------------------------------
+    # Redis is best-effort.
+    # PostgreSQL has already committed.
+    # --------------------------------------------------------
+
+    try:
+        await invalidate_balance(
+            account.account_id
+        )
+    except Exception:
+        logger.exception(
+            "Redis cache invalidation failed "
+            "for account %s",
+            account.account_id,
+        )
 
     return transaction, account
 
+
+# ============================================================
+# GET CURRENT BALANCE
+# ============================================================
 
 async def get_balance(
     db: AsyncSession,
     account_id: UUID,
 ) -> Decimal:
 
-    # Make sure account exists
+    # --------------------------------------------------------
+    # Try Redis first
+    # --------------------------------------------------------
+
+    try:
+        cached_balance = await get_cached_balance(
+            account_id
+        )
+
+        if cached_balance is not None:
+            return cached_balance
+
+    except Exception:
+        logger.exception(
+            "Redis cache read failed "
+            "for account %s",
+            account_id,
+        )
+
+    # --------------------------------------------------------
+    # PostgreSQL is the source of truth
+    # --------------------------------------------------------
+
     result = await db.execute(
         select(Account).where(
             Account.account_id == account_id
@@ -122,7 +230,6 @@ async def get_balance(
     if account is None:
         raise ValueError("Account not found")
 
-    # Reconstruct balance from ledger
     result = await db.execute(
         select(
             func.coalesce(
@@ -134,17 +241,43 @@ async def get_balance(
         )
     )
 
-    balance = result.scalar_one()
+    balance = Decimal(
+        str(result.scalar_one())
+    )
 
-    return Decimal(str(balance))
+    # --------------------------------------------------------
+    # Populate cache
+    # Cache failure must NOT fail request
+    # --------------------------------------------------------
 
+    try:
+        await set_cached_balance(
+            account_id,
+            balance,
+        )
+    except Exception:
+        logger.exception(
+            "Redis cache write failed "
+            "for account %s",
+            account_id,
+        )
+
+    return balance
+
+
+# ============================================================
+# WITHDRAWAL
+# ============================================================
 
 async def create_withdrawal(
     db: AsyncSession,
     account_id: UUID,
     amount: Decimal,
 ):
+    # --------------------------------------------------------
     # Lock account before checking balance
+    # --------------------------------------------------------
+
     result = await db.execute(
         select(Account)
         .where(
@@ -161,16 +294,32 @@ async def create_withdrawal(
     if account.status != AccountStatus.ACTIVE:
         raise ValueError("Account is not active")
 
+    # --------------------------------------------------------
     # Calculate balance while account is locked
-    current_balance = await get_balance(
-        db,
-        account_id,
+    # --------------------------------------------------------
+
+    result = await db.execute(
+        select(
+            func.coalesce(
+                func.sum(LedgerEntry.amount),
+                0,
+            )
+        ).where(
+            LedgerEntry.account_id == account_id
+        )
+    )
+
+    current_balance = Decimal(
+        str(result.scalar_one())
     )
 
     if current_balance < amount:
         raise ValueError("Insufficient funds")
 
+    # --------------------------------------------------------
     # Find SYSTEM_CASH
+    # --------------------------------------------------------
+
     result = await db.execute(
         select(Account).where(
             Account.account_type == AccountType.SYSTEM,
@@ -181,7 +330,13 @@ async def create_withdrawal(
     system_account = result.scalar_one_or_none()
 
     if system_account is None:
-        raise ValueError("SYSTEM_CASH account not found")
+        raise ValueError(
+            "SYSTEM_CASH account not found"
+        )
+
+    # --------------------------------------------------------
+    # Create transaction
+    # --------------------------------------------------------
 
     transaction = Transaction(
         transaction_type=TransactionType.WITHDRAWAL,
@@ -212,10 +367,55 @@ async def create_withdrawal(
         system_entry,
     ])
 
+    # --------------------------------------------------------
+    # Create Outbox Event
+    # --------------------------------------------------------
+
+    await create_outbox_event(
+        db=db,
+        aggregate_id=transaction.transaction_id,
+        event_type="WITHDRAWAL_POSTED",
+        payload={
+            "transaction_id": str(
+                transaction.transaction_id
+            ),
+            "account_id": str(
+                account.account_id
+            ),
+            "amount": str(amount),
+            "currency": account.currency,
+        },
+    )
+
+    # --------------------------------------------------------
+    # Atomic commit
+    # --------------------------------------------------------
+
     await db.commit()
+
     await db.refresh(transaction)
 
+    # --------------------------------------------------------
+    # Redis is best-effort
+    # --------------------------------------------------------
+
+    try:
+        await invalidate_balance(
+            account.account_id
+        )
+    except Exception:
+        logger.exception(
+            "Redis cache invalidation failed "
+            "for account %s",
+            account.account_id,
+        )
+
     return transaction, account
+
+
+# ============================================================
+# TRANSFER
+# ============================================================
 
 async def create_transfer(
     db: AsyncSession,
@@ -230,13 +430,14 @@ async def create_transfer(
         amount,
     )
 
-    # --------------------------------------------------
+    # --------------------------------------------------------
     # 1. Fast idempotency check
-    # --------------------------------------------------
+    # --------------------------------------------------------
 
     result = await db.execute(
         select(Transaction).where(
-            Transaction.idempotency_key == idempotency_key
+            Transaction.idempotency_key
+            == idempotency_key
         )
     )
 
@@ -244,171 +445,49 @@ async def create_transfer(
 
     if existing_transaction is not None:
 
-        if existing_transaction.request_hash != request_hash:
+        if (
+            existing_transaction.request_hash
+            != request_hash
+        ):
             raise ValueError(
-                "Idempotency key already used for a different request"
+                "Idempotency key already used "
+                "for a different request"
             )
 
         return existing_transaction
 
-    # --------------------------------------------------
+    # --------------------------------------------------------
     # 2. Validate accounts
-    # --------------------------------------------------
+    # --------------------------------------------------------
 
     if from_account_id == to_account_id:
         raise ValueError(
-            "Source and destination accounts must be different"
+            "Source and destination accounts "
+            "must be different"
         )
 
-    account_ids = sorted([
-        from_account_id,
-        to_account_id,
-    ])
-
-    result = await db.execute(
-        select(Account)
-        .where(Account.account_id.in_(account_ids))
-        .order_by(Account.account_id)
-        .with_for_update()
-    )
-
-    accounts = result.scalars().all()
-
-    if len(accounts) != 2:
-        raise ValueError(
-            "One or both accounts not found"
-        )
-
-    account_map = {
-        account.account_id: account
-        for account in accounts
-    }
-
-    source = account_map[from_account_id]
-    destination = account_map[to_account_id]
-
-    if source.status != AccountStatus.ACTIVE:
-        raise ValueError(
-            "Source account is not active"
-        )
-
-    if destination.status != AccountStatus.ACTIVE:
-        raise ValueError(
-            "Destination account is not active"
-        )
-
-    if source.currency != destination.currency:
-        raise ValueError(
-            "Currency mismatch"
-        )
-
-    # --------------------------------------------------
-    # 3. Calculate source balance
-    # --------------------------------------------------
-
-    result = await db.execute(
-        select(
-            func.coalesce(
-                func.sum(LedgerEntry.amount),
-                0,
-            )
-        ).where(
-            LedgerEntry.account_id == from_account_id
-        )
-    )
-
-    source_balance = Decimal(
-        str(result.scalar_one())
-    )
-
-    if source_balance < amount:
-        raise ValueError(
-            "Insufficient funds"
-        )
-
-    # --------------------------------------------------
-    # 4. Create transaction inside SAVEPOINT
-    # --------------------------------------------------
-
-    try:
-
-        async with db.begin_nested():
-
-            transaction = Transaction(
-                transaction_type=TransactionType.TRANSFER,
-                status=TransactionStatus.POSTED,
-                reference="Transfer",
-                idempotency_key=idempotency_key,
-                request_hash=request_hash,
-            )
-
-            db.add(transaction)
-
-            await db.flush()
-
-            source_entry = LedgerEntry(
-                transaction_id=transaction.transaction_id,
-                account_id=from_account_id,
-                amount=-amount,
-            )
-
-            destination_entry = LedgerEntry(
-                transaction_id=transaction.transaction_id,
-                account_id=to_account_id,
-                amount=amount,
-            )
-
-            db.add_all([
-                source_entry,
-                destination_entry,
-            ])
-
-        # Savepoint succeeded.
-        # Now commit the outer transaction.
-        await db.commit()
-
-        await db.refresh(transaction)
-
-        return transaction
-
-    except IntegrityError:
-
-        # Another concurrent request won the idempotency race.
-        await db.rollback()
-
-        result = await db.execute(
-            select(Transaction).where(
-                Transaction.idempotency_key == idempotency_key
-            )
-        )
-
-        existing_transaction = result.scalar_one_or_none()
-
-        if existing_transaction is None:
-            raise
-
-        if existing_transaction.request_hash != request_hash:
-            raise ValueError(
-                "Idempotency key already used for a different request"
-            )
-
-        return existing_transaction
-
-    # --------------------------------------------------
-    # 2. Validate accounts
-    # --------------------------------------------------
-
-    if from_account_id == to_account_id:
-        raise ValueError(
-            "Source and destination accounts must be different"
-        )
-
+    # --------------------------------------------------------
+    # IMPORTANT:
+    #
     # Always lock accounts in deterministic order.
-    # This prevents deadlocks between opposite transfers.
+    #
+    # This prevents deadlocks between:
+    #
+    # Alice -> Bob
+    # Bob   -> Alice
+    #
+    # Both requests acquire locks in the same order.
+    # --------------------------------------------------------
+
     account_ids = sorted([
         from_account_id,
         to_account_id,
     ])
+
+    # --------------------------------------------------------
+    # Measure row-lock acquisition time
+    # --------------------------------------------------------
+
 
     result = await db.execute(
         select(Account)
@@ -445,13 +524,13 @@ async def create_transfer(
         )
 
     if source.currency != destination.currency:
-        raise ValueError(
-            "Currency mismatch"
-        )
+        raise ValueError("Currency mismatch")
 
-    # --------------------------------------------------
+    # --------------------------------------------------------
     # 3. Calculate source balance
-    # --------------------------------------------------
+    #
+    # Accounts are already locked.
+    # --------------------------------------------------------
 
     result = await db.execute(
         select(
@@ -460,7 +539,8 @@ async def create_transfer(
                 0,
             )
         ).where(
-            LedgerEntry.account_id == from_account_id
+            LedgerEntry.account_id
+            == from_account_id
         )
     )
 
@@ -469,57 +549,134 @@ async def create_transfer(
     )
 
     if source_balance < amount:
-        raise ValueError(
-            "Insufficient funds"
+        raise ValueError("Insufficient funds")
+
+    # --------------------------------------------------------
+    # 4. Create transaction
+    # --------------------------------------------------------
+
+    try:
+        async with db.begin_nested():
+
+            transaction = Transaction(
+                transaction_type=TransactionType.TRANSFER,
+                status=TransactionStatus.POSTED,
+                reference="Transfer",
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+            )
+
+            db.add(transaction)
+
+            await db.flush()
+
+            # ------------------------------------------------
+            # 5. Double-entry ledger records
+            # ------------------------------------------------
+
+            source_entry = LedgerEntry(
+                transaction_id=transaction.transaction_id,
+                account_id=from_account_id,
+                amount=-amount,
+            )
+
+            destination_entry = LedgerEntry(
+                transaction_id=transaction.transaction_id,
+                account_id=to_account_id,
+                amount=amount,
+            )
+
+            db.add_all([
+                source_entry,
+                destination_entry,
+            ])
+
+            # ------------------------------------------------
+            # 6. Create Outbox Event
+            # ------------------------------------------------
+
+            await create_outbox_event(
+                db=db,
+                aggregate_id=transaction.transaction_id,
+                event_type="TRANSFER_POSTED",
+                payload={
+                    "transaction_id": str(
+                        transaction.transaction_id
+                    ),
+                    "from_account_id": str(
+                        from_account_id
+                    ),
+                    "to_account_id": str(
+                        to_account_id
+                    ),
+                    "amount": str(amount),
+                    "currency": source.currency,
+                },
+            )
+        await db.commit()
+        await db.refresh(transaction)
+
+        # ----------------------------------------------------
+        # Redis invalidation is AFTER DB commit.
+        #
+        # Redis failure cannot rollback money.
+        # ----------------------------------------------------
+
+        try:
+            await invalidate_balance(
+                from_account_id
+            )
+
+            await invalidate_balance(
+                to_account_id
+            )
+
+        except Exception:
+            logger.exception(
+                "Redis cache invalidation failed "
+                "for transfer"
+            )
+
+        return transaction
+
+    except IntegrityError:
+
+        # ----------------------------------------------------
+        # Another concurrent request won
+        # the idempotency race.
+        # ----------------------------------------------------
+
+        await db.rollback()
+
+        result = await db.execute(
+            select(Transaction).where(
+                Transaction.idempotency_key
+                == idempotency_key
+            )
         )
 
-    # --------------------------------------------------
-    # 4. Create transaction
-    # --------------------------------------------------
+        existing_transaction = (
+            result.scalar_one_or_none()
+        )
 
-    transaction = Transaction(
-        transaction_type=TransactionType.TRANSFER,
-        status=TransactionStatus.POSTED,
-        reference="Transfer",
-        idempotency_key=idempotency_key,
-        request_hash=request_hash,
-    )
+        if existing_transaction is None:
+            raise
 
-    db.add(transaction)
+        if (
+            existing_transaction.request_hash
+            != request_hash
+        ):
+            raise ValueError(
+                "Idempotency key already used "
+                "for a different request"
+            )
 
-    await db.flush()
+        return existing_transaction
 
-    # --------------------------------------------------
-    # 5. Create double-entry ledger records
-    # --------------------------------------------------
 
-    source_entry = LedgerEntry(
-        transaction_id=transaction.transaction_id,
-        account_id=from_account_id,
-        amount=-amount,
-    )
-
-    destination_entry = LedgerEntry(
-        transaction_id=transaction.transaction_id,
-        account_id=to_account_id,
-        amount=amount,
-    )
-
-    db.add_all([
-        source_entry,
-        destination_entry,
-    ])
-
-    # --------------------------------------------------
-    # 6. Commit atomically
-    # --------------------------------------------------
-
-    await db.commit()
-
-    await db.refresh(transaction)
-
-    return transaction
-
+# ============================================================
+# TRANSACTION HISTORY
+# ============================================================
 
 async def get_transaction_history(
     db: AsyncSession,
@@ -527,7 +684,10 @@ async def get_transaction_history(
     limit: int = 50,
     offset: int = 0,
 ):
+    # --------------------------------------------------------
     # Make sure account exists
+    # --------------------------------------------------------
+
     result = await db.execute(
         select(Account).where(
             Account.account_id == account_id
@@ -564,13 +724,20 @@ async def get_transaction_history(
     return rows
 
 
+# ============================================================
+# POINT-IN-TIME BALANCE
+# ============================================================
+
 async def get_balance_at(
     db: AsyncSession,
     account_id: UUID,
     timestamp: datetime,
 ) -> Decimal:
 
+    # --------------------------------------------------------
     # Verify account exists
+    # --------------------------------------------------------
+
     result = await db.execute(
         select(Account).where(
             Account.account_id == account_id
@@ -582,7 +749,10 @@ async def get_balance_at(
     if account is None:
         raise ValueError("Account not found")
 
+    # --------------------------------------------------------
     # Reconstruct balance using transaction time
+    # --------------------------------------------------------
+
     result = await db.execute(
         select(
             func.coalesce(

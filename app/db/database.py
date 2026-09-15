@@ -11,7 +11,9 @@ engine = create_async_engine(
     settings.database_url,
     echo=False,
 )
-
+print("POOL SIZE:", engine.pool.size())
+print("POOL CHECKED OUT:", engine.pool.checkedout())
+print("POOL OVERFLOW:", engine.pool.overflow())
 AsyncSessionLocal = async_sessionmaker(
     bind=engine,
     class_=AsyncSession,

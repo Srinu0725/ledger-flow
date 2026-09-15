@@ -111,15 +111,13 @@ async def withdraw(
             detail=str(e),
         )
         
-@router.post(
-    "/transfer",
-    response_model=TransferResponse,
-)
+@router.post("/transfer", response_model=TransferResponse)
 async def transfer(
     request: TransferRequest,
     idempotency_key: str = Header(..., alias="Idempotency-Key"),
     db: AsyncSession = Depends(get_db),
 ):
+
     try:
         transaction = await create_transfer(
             db=db,
@@ -128,6 +126,7 @@ async def transfer(
             amount=request.amount,
             idempotency_key=idempotency_key,
         )
+
 
         return TransferResponse(
             transaction_id=transaction.transaction_id,
@@ -141,9 +140,7 @@ async def transfer(
         raise HTTPException(
             status_code=400,
             detail=str(e),
-        )        
-        
-        
+        )
 @router.get(
     "/accounts/{account_id}/transactions",
     response_model=TransactionHistoryResponse,
