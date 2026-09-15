@@ -179,8 +179,6 @@ async def test_withdrawal_invalidates_balance_cache(db):
     cached = await redis_db.redis_client.get(key)
 
     assert cached == "800.00"
-    
-    
 @pytest.mark.asyncio
 async def test_transfer_invalidates_both_balance_caches(db):
 
@@ -293,7 +291,5 @@ async def test_transfer_invalidates_both_balance_caches(db):
         db=db,
         account_id=bob.account_id,
     )
-
     assert alice_balance == Decimal("800.00")
-    assert bob_balance == Decimal("200.00")    
-    
+    assert bob_balance == Decimal("200.00")
